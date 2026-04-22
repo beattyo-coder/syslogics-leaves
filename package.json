@@ -1,0 +1,492 @@
+import { useState, useEffect } from "react";
+import { MONTHS_HE, INITIAL_EMPLOYEES, INITIAL_LEAVES } from "./data.js";
+import { exportToExcel } from "./export.js";
+
+// ─── Storage ───
+const STORAGE_KEY = "syslogics-leave-data-v1";
+function load() { try { const d = JSON.parse(localStorage.getItem(STORAGE_KEY)); if (d?.employees) return d; } catch {} return null; }
+function save(employees, leaves) { try { localStorage.setItem(STORAGE_KEY, JSON.stringify({ employees, leaves, ts: Date.now() })); } catch {} }
+
+// ─── Utils ───
+function formatDate(d) { return new Date(d).toLocaleDateString("he-IL", { day: "numeric", month: "short", year: "numeric" }); }
+function calcWorkDays(s, e) { let c = 0, d = new Date(s); const end = new Date(e); while (d <= end) { if (d.getDay() !== 5 && d.getDay() !== 6) c++; d.setDate(d.getDate() + 1); } return Math.max(c, 0.5); }
+
+// ─── URL Routing ───
+function getRoute() {
+  const hash = window.location.hash.slice(1);
+  if (hash.startsWith("view/")) return { mode: "view", empId: parseInt(hash.split("/")[1]) || null };
+  if (hash === "view") return { mode: "view", empId: null };
+  return { mode: "admin", empId: null };
+}
+
+// ─── Small Components ───
+const Badge = ({ status }) => {
+  const m = { approved: { bg: "#dcfce7", c: "#15803d", t: "אושר" }, pending: { bg: "#fef3c7", c: "#b45309", t: "ממתין" }, rejected: { bg: "#fee2e2", c: "#b91c1c", t: "נדחה" } };
+  const s = m[status] || m.pending;
+  return <span style={{ background: s.bg, color: s.c, padding: "3px 14px", borderRadius: 20, fontSize: 11, fontWeight: 700 }}>{s.t}</span>;
+};
+const Bar = ({ used, color }) => (
+  <div style={{ background: "#1e293b", borderRadius: 4, height: 6, overflow: "hidden" }}>
+    <div style={{ height: "100%", width: `${Math.min(used * 8, 100)}%`, background: color, borderRadius: 4, transition: "width 0.5s" }} />
+  </div>
+);
+const Stat = ({ icon, label, value, accent, sub }) => (
+  <div style={{ background: "#0f172a", borderRadius: 14, padding: "20px 22px", border: "1px solid #1e293b", position: "relative", overflow: "hidden" }}>
+    <div style={{ position: "absolute", top: -8, left: -8, fontSize: 56, opacity: 0.06 }}>{icon}</div>
+    <div style={{ fontSize: 12, color: "#64748b", fontWeight: 600, marginBottom: 6 }}>{label}</div>
+    <div style={{ fontSize: 30, fontWeight: 800, color: accent || "#f8fafc", letterSpacing: "-1px" }}>{value}</div>
+    {sub && <div style={{ fontSize: 11, color: "#475569", marginTop: 4 }}>{sub}</div>}
+  </div>
+);
+const Label = ({ t, children }) => <div style={{ marginBottom: 14 }}><div style={{ fontSize: 12, fontWeight: 700, color: "#64748b", marginBottom: 5 }}>{t}</div>{children}</div>;
+const IS = { width: "100%", padding: "10px 14px", borderRadius: 10, border: "1px solid #334155", background: "#0f172a", fontSize: 14, color: "#f1f5f9", outline: "none", boxSizing: "border-box", fontFamily: "inherit" };
+
+export default function App() {
+  const [route, setRoute] = useState(getRoute());
+  const [initialized, setInitialized] = useState(false);
+  const [employees, setEmployees] = useState(INITIAL_EMPLOYEES);
+  const [leaves, setLeaves] = useState(INITIAL_LEAVES);
+  const [view, setView] = useState("dashboard");
+  const [selectedEmp, setSelectedEmp] = useState(null);
+  const [modal, setModal] = useState(null);
+  const [editData, setEditData] = useState(null);
+  const [filterType, setFilterType] = useState("all");
+  const [filterStatus, setFilterStatus] = useState("all");
+  const [search, setSearch] = useState("");
+  const [saveIndicator, setSaveIndicator] = useState(false);
+  const [showSharePanel, setShowSharePanel] = useState(false);
+  const [copied, setCopied] = useState(null);
+
+  const isViewOnly = route.mode === "view";
+
+  useEffect(() => {
+    const onHash = () => setRoute(getRoute());
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
+  }, []);
+
+  // Load
+  useEffect(() => {
+    const d = load();
+    if (d) { setEmployees(d.employees); setLeaves(d.leaves); }
+    setInitialized(true);
+  }, []);
+
+  // If view-only with specific emp
+  useEffect(() => {
+    if (route.mode === "view" && route.empId) {
+      setSelectedEmp(route.empId);
+      setView("leaves");
+    }
+  }, [route]);
+
+  // Save
+  useEffect(() => {
+    if (!initialized || isViewOnly) return;
+    save(employees, leaves);
+    setSaveIndicator(true);
+    const t = setTimeout(() => setSaveIndicator(false), 1500);
+    return () => clearTimeout(t);
+  }, [employees, leaves, initialized]);
+
+  const nextId = arr => Math.max(0, ...arr.map(x => x.id)) + 1;
+  const totalVac = employees.reduce((s, e) => s + e.vacationUsed, 0);
+  const totalSick = employees.reduce((s, e) => s + e.sickUsed, 0);
+  const pendingCount = leaves.filter(l => l.status === "pending").length;
+
+  // Handlers (admin only)
+  const addEmployee = d => { setEmployees(p => [...p, { ...d, id: nextId(p), vacationUsed: 0, sickUsed: 0 }]); setModal(null); };
+  const updateEmployee = d => { setEmployees(p => p.map(e => e.id === d.id ? { ...e, ...d } : e)); setModal(null); };
+  const deleteEmployee = id => { setEmployees(p => p.filter(e => e.id !== id)); setLeaves(p => p.filter(l => l.empId !== id)); };
+  const addLeave = d => { setLeaves(p => [...p, { ...d, id: nextId(p), status: "pending" }]); setModal(null); };
+  const approveLeave = id => {
+    setLeaves(p => p.map(l => {
+      if (l.id !== id || l.status !== "pending") return l;
+      setEmployees(es => es.map(e => {
+        if (e.id !== l.empId) return e;
+        return l.type === "vacation" ? { ...e, vacationUsed: e.vacationUsed + l.days } : { ...e, sickUsed: e.sickUsed + l.days };
+      }));
+      return { ...l, status: "approved" };
+    }));
+  };
+  const rejectLeave = id => setLeaves(p => p.map(l => l.id === id ? { ...l, status: "rejected" } : l));
+  const deleteLeave = id => {
+    const leave = leaves.find(l => l.id === id);
+    if (leave?.status === "approved") {
+      setEmployees(p => p.map(e => {
+        if (e.id !== leave.empId) return e;
+        return leave.type === "vacation" ? { ...e, vacationUsed: Math.max(0, e.vacationUsed - leave.days) } : { ...e, sickUsed: Math.max(0, e.sickUsed - leave.days) };
+      }));
+    }
+    setLeaves(p => p.filter(l => l.id !== id));
+  };
+
+  const filteredLeaves = leaves.filter(l => {
+    if (filterType !== "all" && l.type !== filterType) return false;
+    if (filterStatus !== "all" && l.status !== filterStatus) return false;
+    if (selectedEmp && l.empId !== selectedEmp) return false;
+    if (search) { const emp = employees.find(e => e.id === l.empId); if (!emp?.name.includes(search)) return false; }
+    return true;
+  }).sort((a, b) => new Date(b.startDate) - new Date(a.startDate));
+
+  const monthlyData = MONTHS_HE.map((_, i) => {
+    const vac = leaves.filter(l => l.type === "vacation" && l.status === "approved" && new Date(l.startDate).getMonth() === i).reduce((s, l) => s + l.days, 0);
+    const sick = leaves.filter(l => l.type === "sick" && l.status === "approved" && new Date(l.startDate).getMonth() === i).reduce((s, l) => s + l.days, 0);
+    return { month: MONTHS_HE[i], vac, sick };
+  });
+  const maxMonth = Math.max(1, ...monthlyData.map(d => d.vac + d.sick));
+
+  function copyLink(url) {
+    navigator.clipboard.writeText(url).then(() => { setCopied(url); setTimeout(() => setCopied(null), 2000); });
+  }
+
+  const baseUrl = window.location.origin + window.location.pathname;
+
+  return (
+    <div dir="rtl" style={{ minHeight: "100vh" }}>
+      {/* VIEW-ONLY BANNER */}
+      {isViewOnly && (
+        <div style={{ background: "linear-gradient(90deg,#1e40af,#6366f1)", padding: "10px 20px", textAlign: "center", fontSize: 13, fontWeight: 700, color: "white" }}>
+          👁️ מצב צפייה בלבד {route.empId ? `— ${employees.find(e => e.id === route.empId)?.name || ""}` : "— כל העובדים"}
+        </div>
+      )}
+
+      {/* HEADER */}
+      <div style={{ background: "linear-gradient(135deg,#1e1b4b 0%,#0f172a 50%,#042f2e 100%)", borderBottom: "1px solid #1e293b" }}>
+        <div style={{ maxWidth: 1200, margin: "0 auto", padding: "24px 20px 0" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12, marginBottom: 20 }}>
+            <div>
+              <h1 style={{ margin: 0, fontSize: 24, fontWeight: 900, background: "linear-gradient(135deg,#a5b4fc,#67e8f9)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>
+                Syslogics · ניהול היעדרויות 2026
+              </h1>
+              {!isViewOnly && (
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 4 }}>
+                  <div style={{ width: 8, height: 8, borderRadius: "50%", background: "#22c55e", animation: "pulse 2s infinite" }} />
+                  <span style={{ fontSize: 11, color: "#64748b" }}>שמירה אוטומטית</span>
+                  {saveIndicator && <span style={{ fontSize: 11, color: "#22c55e", fontWeight: 600 }}>✓ נשמר</span>}
+                </div>
+              )}
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+              {!isViewOnly && (
+                <>
+                  <button onClick={() => setShowSharePanel(true)}
+                    style={{ padding: "9px 18px", borderRadius: 10, border: "1px solid #334155", background: "#1e293b", color: "#a5b4fc", fontWeight: 700, cursor: "pointer", fontSize: 12 }}>
+                    🔗 שיתוף לינקים
+                  </button>
+                  <button onClick={() => exportToExcel(employees, leaves)}
+                    style={{ padding: "9px 18px", borderRadius: 10, border: "1px solid #334155", background: "#1e293b", color: "#67e8f9", fontWeight: 700, cursor: "pointer", fontSize: 12 }}>
+                    📥 ייצוא Excel
+                  </button>
+                </>
+              )}
+            </div>
+          </div>
+          <div style={{ display: "flex", gap: 2, overflowX: "auto" }}>
+            {(isViewOnly
+              ? [{ id: "dashboard", icon: "📊", label: "דשבורד" }, { id: "leaves", icon: "📅", label: "היעדרויות" }]
+              : [{ id: "dashboard", icon: "📊", label: "דשבורד" }, { id: "employees", icon: "👥", label: "עובדים" }, { id: "leaves", icon: "📅", label: "היעדרויות" }]
+            ).map(t => (
+              <button key={t.id} onClick={() => { setView(t.id); if (!isViewOnly) setSelectedEmp(null); setSearch(""); }}
+                style={{
+                  padding: "11px 20px", borderRadius: "10px 10px 0 0", border: "none", cursor: "pointer", fontSize: 13, fontWeight: 700, whiteSpace: "nowrap",
+                  background: view === t.id ? "#0f172a" : "transparent", color: view === t.id ? "#e2e8f0" : "#64748b",
+                  borderTop: view === t.id ? "2px solid #6366f1" : "2px solid transparent",
+                }}>{t.icon} {t.label}</button>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      <div style={{ maxWidth: 1200, margin: "0 auto", padding: "24px 20px 60px" }}>
+
+        {/* ═══ DASHBOARD ═══ */}
+        {view === "dashboard" && (
+          <div style={{ animation: "fadeUp 0.35s ease" }}>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(200px,1fr))", gap: 14, marginBottom: 32 }}>
+              <Stat icon="👥" label="עובדים" value={employees.length} accent="#a5b4fc" />
+              <Stat icon="🏖️" label="סה״כ ימי חופשה" value={totalVac} accent="#22d3ee" />
+              <Stat icon="🏥" label="סה״כ ימי מחלה" value={totalSick} accent="#f87171" />
+              {!isViewOnly && <Stat icon="⏳" label="ממתינות לאישור" value={pendingCount} accent="#fbbf24" />}
+            </div>
+
+            {/* Chart */}
+            <div style={{ background: "#0f172a", borderRadius: 16, border: "1px solid #1e293b", padding: "20px 24px", marginBottom: 28 }}>
+              <h3 style={{ margin: "0 0 16px", fontSize: 15, fontWeight: 700, color: "#94a3b8" }}>פילוח חודשי — 2026</h3>
+              <div style={{ display: "flex", gap: 6, alignItems: "flex-end", height: 120 }}>
+                {monthlyData.map((d, i) => (
+                  <div key={i} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 3 }}>
+                    <div style={{ display: "flex", flexDirection: "column", justifyContent: "flex-end", height: 90, width: "100%", gap: 1 }}>
+                      {d.sick > 0 && <div style={{ height: `${(d.sick / maxMonth) * 90}px`, background: "#ef4444", borderRadius: 3, minHeight: 2 }} title={`מחלה: ${d.sick}`} />}
+                      {d.vac > 0 && <div style={{ height: `${(d.vac / maxMonth) * 90}px`, background: "#6366f1", borderRadius: 3, minHeight: 2 }} title={`חופשה: ${d.vac}`} />}
+                    </div>
+                    <div style={{ fontSize: 10, color: "#475569", fontWeight: 600 }}>{d.month.slice(0, 3)}</div>
+                  </div>
+                ))}
+              </div>
+              <div style={{ display: "flex", gap: 16, marginTop: 12, justifyContent: "center" }}>
+                <span style={{ fontSize: 11, color: "#94a3b8" }}><span style={{ display: "inline-block", width: 10, height: 10, borderRadius: 2, background: "#6366f1", marginLeft: 4 }} />חופשה</span>
+                <span style={{ fontSize: 11, color: "#94a3b8" }}><span style={{ display: "inline-block", width: 10, height: 10, borderRadius: 2, background: "#ef4444", marginLeft: 4 }} />מחלה</span>
+              </div>
+            </div>
+
+            {/* Employee cards */}
+            <h3 style={{ fontSize: 15, fontWeight: 700, color: "#94a3b8", marginBottom: 14 }}>סקירת עובדים</h3>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(260px,1fr))", gap: 12 }}>
+              {(isViewOnly && route.empId ? employees.filter(e => e.id === route.empId) : employees).map(emp => (
+                <div key={emp.id} onClick={() => { setSelectedEmp(emp.id); setView("leaves"); }}
+                  style={{ background: "#0f172a", borderRadius: 14, padding: "18px 20px", border: "1px solid #1e293b", cursor: "pointer", transition: "all 0.2s" }}
+                  onMouseEnter={e => { e.currentTarget.style.borderColor = "#334155"; e.currentTarget.style.transform = "translateY(-1px)"; }}
+                  onMouseLeave={e => { e.currentTarget.style.borderColor = "#1e293b"; e.currentTarget.style.transform = ""; }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14 }}>
+                    <span style={{ fontSize: 30 }}>{emp.avatar}</span>
+                    <div style={{ fontWeight: 700, fontSize: 15 }}>{emp.name}</div>
+                  </div>
+                  <div style={{ display: "flex", gap: 16 }}>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: "#64748b", marginBottom: 4 }}>
+                        <span>חופשה</span><span style={{ color: "#a5b4fc", fontWeight: 700 }}>{emp.vacationUsed} ימים</span>
+                      </div>
+                      <Bar used={emp.vacationUsed} color="#6366f1" />
+                    </div>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: "#64748b", marginBottom: 4 }}>
+                        <span>מחלה</span><span style={{ color: "#f87171", fontWeight: 700 }}>{emp.sickUsed} ימים</span>
+                      </div>
+                      <Bar used={emp.sickUsed} color="#ef4444" />
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {/* Pending - admin only */}
+            {!isViewOnly && pendingCount > 0 && (
+              <div style={{ marginTop: 28 }}>
+                <h3 style={{ fontSize: 15, fontWeight: 700, color: "#fbbf24", marginBottom: 14 }}>⏳ בקשות ממתינות</h3>
+                {leaves.filter(l => l.status === "pending").map(l => {
+                  const emp = employees.find(e => e.id === l.empId);
+                  return (
+                    <div key={l.id} style={{ background: "#0f172a", borderRadius: 12, padding: "14px 18px", marginBottom: 8, border: "1px solid #1e293b", display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+                      <span style={{ fontSize: 26 }}>{emp?.avatar}</span>
+                      <div style={{ flex: 1, minWidth: 150 }}>
+                        <div style={{ fontWeight: 700, fontSize: 14 }}>{emp?.name}</div>
+                        <div style={{ fontSize: 12, color: "#64748b" }}>{l.type === "vacation" ? "🏖️ חופשה" : "🏥 מחלה"} · {l.days} ימים · {formatDate(l.startDate)} — {formatDate(l.endDate)}</div>
+                      </div>
+                      <div style={{ display: "flex", gap: 6 }}>
+                        <button onClick={() => approveLeave(l.id)} style={{ padding: "7px 16px", borderRadius: 8, border: "none", background: "#166534", color: "#bbf7d0", fontWeight: 700, cursor: "pointer", fontSize: 12 }}>✓ אשר</button>
+                        <button onClick={() => rejectLeave(l.id)} style={{ padding: "7px 16px", borderRadius: 8, border: "none", background: "#7f1d1d", color: "#fecaca", fontWeight: 700, cursor: "pointer", fontSize: 12 }}>✕ דחה</button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ═══ EMPLOYEES (admin) ═══ */}
+        {view === "employees" && !isViewOnly && (
+          <div style={{ animation: "fadeUp 0.35s ease" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 18, flexWrap: "wrap", gap: 10 }}>
+              <h3 style={{ margin: 0, fontSize: 18, fontWeight: 800 }}>עובדים ({employees.length})</h3>
+              <button onClick={() => { setEditData(null); setModal("addEmp"); }} style={{ padding: "10px 22px", borderRadius: 10, border: "none", background: "#6366f1", color: "white", fontWeight: 700, cursor: "pointer", fontSize: 13 }}>+ הוסף עובד</button>
+            </div>
+            <div style={{ display: "grid", gap: 8 }}>
+              {employees.map(emp => (
+                <div key={emp.id} style={{ background: "#0f172a", borderRadius: 14, padding: "16px 20px", border: "1px solid #1e293b", display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
+                  <span style={{ fontSize: 36 }}>{emp.avatar}</span>
+                  <div style={{ flex: 1, minWidth: 140 }}>
+                    <div style={{ fontWeight: 700, fontSize: 16 }}>{emp.name}</div>
+                    <div style={{ fontSize: 12, color: "#64748b" }}>{leaves.filter(l => l.empId === emp.id && l.status === "approved").length} רשומות</div>
+                  </div>
+                  <div style={{ display: "flex", gap: 20, alignItems: "center" }}>
+                    <div style={{ textAlign: "center" }}><div style={{ fontSize: 10, color: "#64748b", fontWeight: 600 }}>חופשה</div><div style={{ fontSize: 20, fontWeight: 800, color: "#a5b4fc" }}>{emp.vacationUsed}</div></div>
+                    <div style={{ textAlign: "center" }}><div style={{ fontSize: 10, color: "#64748b", fontWeight: 600 }}>מחלה</div><div style={{ fontSize: 20, fontWeight: 800, color: "#f87171" }}>{emp.sickUsed}</div></div>
+                  </div>
+                  <div style={{ display: "flex", gap: 5 }}>
+                    <button onClick={() => { setEditData(emp); setModal("editEmp"); }} style={{ width: 34, height: 34, borderRadius: 8, border: "1px solid #334155", background: "#1e293b", cursor: "pointer", fontSize: 14, display: "flex", alignItems: "center", justifyContent: "center" }}>✏️</button>
+                    <button onClick={() => { setSelectedEmp(emp.id); setView("leaves"); }} style={{ width: 34, height: 34, borderRadius: 8, border: "1px solid #334155", background: "#1e293b", cursor: "pointer", fontSize: 14, display: "flex", alignItems: "center", justifyContent: "center" }}>📅</button>
+                    <button onClick={() => copyLink(`${baseUrl}#view/${emp.id}`)} title="העתק לינק צפייה" style={{ width: 34, height: 34, borderRadius: 8, border: "1px solid #312e81", background: "#1e1b4b", cursor: "pointer", fontSize: 14, display: "flex", alignItems: "center", justifyContent: "center" }}>🔗</button>
+                    <button onClick={() => { if (confirm(`למחוק את ${emp.name}?`)) deleteEmployee(emp.id); }} style={{ width: 34, height: 34, borderRadius: 8, border: "1px solid #7f1d1d", background: "#1c1917", cursor: "pointer", fontSize: 14, display: "flex", alignItems: "center", justifyContent: "center" }}>🗑️</button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* ═══ LEAVES ═══ */}
+        {view === "leaves" && (
+          <div style={{ animation: "fadeUp 0.35s ease" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14, flexWrap: "wrap", gap: 10 }}>
+              <h3 style={{ margin: 0, fontSize: 18, fontWeight: 800 }}>
+                {selectedEmp ? `${employees.find(e => e.id === selectedEmp)?.avatar} ${employees.find(e => e.id === selectedEmp)?.name}` : "כל ההיעדרויות"}
+              </h3>
+              <div style={{ display: "flex", gap: 6 }}>
+                {selectedEmp && !route.empId && <button onClick={() => setSelectedEmp(null)} style={{ padding: "9px 16px", borderRadius: 8, border: "1px solid #334155", background: "#1e293b", color: "#94a3b8", cursor: "pointer", fontSize: 12, fontWeight: 600 }}>הצג הכל</button>}
+                {!isViewOnly && <button onClick={() => setModal("addLeave")} style={{ padding: "9px 20px", borderRadius: 8, border: "none", background: "#6366f1", color: "white", fontWeight: 700, cursor: "pointer", fontSize: 13 }}>+ בקשה חדשה</button>}
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 8, marginBottom: 14, flexWrap: "wrap" }}>
+              <select value={filterType} onChange={e => setFilterType(e.target.value)} style={{ ...IS, width: "auto", minWidth: 110, padding: "8px 12px" }}><option value="all">כל הסוגים</option><option value="vacation">חופשה</option><option value="sick">מחלה</option></select>
+              <select value={filterStatus} onChange={e => setFilterStatus(e.target.value)} style={{ ...IS, width: "auto", minWidth: 110, padding: "8px 12px" }}><option value="all">כל הסטטוסים</option><option value="pending">ממתין</option><option value="approved">אושר</option><option value="rejected">נדחה</option></select>
+              {!selectedEmp && <input placeholder="🔍 חיפוש..." value={search} onChange={e => setSearch(e.target.value)} style={{ ...IS, width: "auto", minWidth: 160, padding: "8px 12px" }} />}
+            </div>
+            <div style={{ background: "#0f172a", borderRadius: 14, border: "1px solid #1e293b", overflow: "hidden" }}>
+              <div style={{ overflowX: "auto" }}>
+                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+                  <thead><tr>{["עובד", "סוג", "תאריכים", "ימים", "סטטוס", "הערה", ...(isViewOnly ? [] : [""])].map(h => (
+                    <th key={h} style={{ padding: "12px 14px", textAlign: "right", fontWeight: 700, color: "#475569", fontSize: 11, borderBottom: "1px solid #1e293b", background: "#0b1120" }}>{h}</th>
+                  ))}</tr></thead>
+                  <tbody>
+                    {filteredLeaves.length === 0 && <tr><td colSpan={7} style={{ padding: 40, textAlign: "center", color: "#475569" }}>אין רשומות</td></tr>}
+                    {filteredLeaves.map(l => {
+                      const emp = employees.find(e => e.id === l.empId);
+                      return (
+                        <tr key={l.id} style={{ borderBottom: "1px solid #1e293b" }}>
+                          <td style={{ padding: "11px 14px", whiteSpace: "nowrap" }}><span style={{ marginLeft: 5 }}>{emp?.avatar}</span>{emp?.name}</td>
+                          <td style={{ padding: "11px 14px" }}>{l.type === "vacation" ? <span style={{ color: "#818cf8" }}>🏖️ חופשה</span> : <span style={{ color: "#f87171" }}>🏥 מחלה</span>}</td>
+                          <td style={{ padding: "11px 14px", fontSize: 12, color: "#94a3b8", whiteSpace: "nowrap" }}>{formatDate(l.startDate)}{l.startDate !== l.endDate ? ` — ${formatDate(l.endDate)}` : ""}</td>
+                          <td style={{ padding: "11px 14px", fontWeight: 800, textAlign: "center" }}>{l.days}</td>
+                          <td style={{ padding: "11px 14px" }}><Badge status={l.status} /></td>
+                          <td style={{ padding: "11px 14px", fontSize: 12, color: "#64748b", maxWidth: 120, overflow: "hidden", textOverflow: "ellipsis" }}>{l.note || "—"}</td>
+                          {!isViewOnly && (
+                            <td style={{ padding: "11px 14px" }}>
+                              <div style={{ display: "flex", gap: 3 }}>
+                                {l.status === "pending" && <>
+                                  <button onClick={() => approveLeave(l.id)} style={{ width: 28, height: 28, borderRadius: 6, border: "none", background: "#166534", color: "#bbf7d0", cursor: "pointer", fontSize: 13 }}>✓</button>
+                                  <button onClick={() => rejectLeave(l.id)} style={{ width: 28, height: 28, borderRadius: 6, border: "none", background: "#7f1d1d", color: "#fecaca", cursor: "pointer", fontSize: 13 }}>✕</button>
+                                </>}
+                                <button onClick={() => deleteLeave(l.id)} style={{ width: 28, height: 28, borderRadius: 6, border: "none", background: "#1e293b", cursor: "pointer", fontSize: 12 }}>🗑</button>
+                              </div>
+                            </td>
+                          )}
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* ═══ SHARE PANEL ═══ */}
+      {showSharePanel && (
+        <div style={{ position: "fixed", inset: 0, zIndex: 1000, background: "rgba(0,0,0,0.6)", backdropFilter: "blur(6px)", display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }} onClick={() => setShowSharePanel(false)}>
+          <div style={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 18, padding: 28, maxWidth: 520, width: "100%", maxHeight: "90vh", overflowY: "auto", animation: "modalIn 0.2s ease" }} onClick={e => e.stopPropagation()}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
+              <h2 style={{ margin: 0, fontSize: 18, fontWeight: 800 }}>🔗 לינקים לשיתוף</h2>
+              <button onClick={() => setShowSharePanel(false)} style={{ background: "none", border: "none", color: "#64748b", fontSize: 20, cursor: "pointer" }}>✕</button>
+            </div>
+
+            {/* All employees view link */}
+            <div style={{ background: "#020617", borderRadius: 12, padding: 16, marginBottom: 12, border: "1px solid #1e293b" }}>
+              <div style={{ fontSize: 14, fontWeight: 700, color: "#a5b4fc", marginBottom: 8 }}>📊 צפייה בכל העובדים</div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <input value={`${baseUrl}#view`} readOnly style={{ ...IS, fontSize: 12, direction: "ltr", flex: 1 }} />
+                <button onClick={() => copyLink(`${baseUrl}#view`)}
+                  style={{ padding: "8px 16px", borderRadius: 8, border: "none", background: copied === `${baseUrl}#view` ? "#166534" : "#6366f1", color: "white", fontWeight: 700, cursor: "pointer", fontSize: 12, whiteSpace: "nowrap" }}>
+                  {copied === `${baseUrl}#view` ? "✓ הועתק!" : "העתק"}
+                </button>
+              </div>
+            </div>
+
+            {/* Per-employee links */}
+            <div style={{ fontSize: 14, fontWeight: 700, color: "#94a3b8", marginBottom: 10 }}>👤 לינק אישי לכל עובד</div>
+            {employees.map(emp => {
+              const url = `${baseUrl}#view/${emp.id}`;
+              return (
+                <div key={emp.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 0", borderBottom: "1px solid #1e293b" }}>
+                  <span style={{ fontSize: 22 }}>{emp.avatar}</span>
+                  <div style={{ flex: 1, fontWeight: 600, fontSize: 13 }}>{emp.name}</div>
+                  <button onClick={() => copyLink(url)}
+                    style={{ padding: "5px 14px", borderRadius: 8, border: "1px solid #334155", background: copied === url ? "#166534" : "#1e293b", color: copied === url ? "#bbf7d0" : "#94a3b8", fontWeight: 700, cursor: "pointer", fontSize: 11, whiteSpace: "nowrap" }}>
+                    {copied === url ? "✓ הועתק!" : "🔗 העתק לינק"}
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* ═══ MODALS ═══ */}
+      {modal && (
+        <div style={{ position: "fixed", inset: 0, zIndex: 1000, background: "rgba(0,0,0,0.6)", backdropFilter: "blur(6px)", display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }} onClick={() => setModal(null)}>
+          <div style={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 18, padding: 28, maxWidth: 440, width: "100%", maxHeight: "90vh", overflowY: "auto", animation: "modalIn 0.2s ease" }} onClick={e => e.stopPropagation()}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 22 }}>
+              <h2 style={{ margin: 0, fontSize: 18, fontWeight: 800 }}>{modal === "addEmp" ? "הוסף עובד" : modal === "editEmp" ? "ערוך עובד" : "בקשת היעדרות"}</h2>
+              <button onClick={() => setModal(null)} style={{ background: "none", border: "none", color: "#64748b", fontSize: 20, cursor: "pointer" }}>✕</button>
+            </div>
+            {(modal === "addEmp" || modal === "editEmp") && <EmpForm data={editData} onSubmit={modal === "addEmp" ? addEmployee : updateEmployee} onCancel={() => setModal(null)} />}
+            {modal === "addLeave" && <LeaveForm employees={employees} defaultEmpId={selectedEmp} onSubmit={addLeave} onCancel={() => setModal(null)} />}
+          </div>
+        </div>
+      )}
+
+      <style>{`
+        @keyframes fadeUp{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}
+        @keyframes modalIn{from{opacity:0;transform:scale(0.96)}to{opacity:1;transform:none}}
+        @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.5}}
+      `}</style>
+    </div>
+  );
+}
+
+function EmpForm({ data, onSubmit, onCancel }) {
+  const [name, setName] = useState(data?.name || "");
+  const [avatar, setAvatar] = useState(data?.avatar || "👤");
+  const avatars = ["👨‍💻", "👩‍💻", "👨‍💼", "👩‍💼", "👨‍🎨", "👩‍🎨", "👩‍🔬", "🧑‍💻", "👨‍🔧", "👩‍⚕️", "👨‍🚀", "🧑‍🏫", "👨‍🎓", "👨‍⚕️", "🧑‍🔧", "👤"];
+  return (
+    <div>
+      <Label t="שם"><input value={name} onChange={e => setName(e.target.value)} style={IS} placeholder="שם העובד" /></Label>
+      <Label t="אייקון"><div style={{ display: "flex", gap: 5, flexWrap: "wrap" }}>{avatars.map(a => (
+        <button key={a} onClick={() => setAvatar(a)} style={{ width: 38, height: 38, borderRadius: 8, fontSize: 20, cursor: "pointer", border: avatar === a ? "2px solid #6366f1" : "1px solid #334155", background: avatar === a ? "#1e1b4b" : "#0f172a", display: "flex", alignItems: "center", justifyContent: "center" }}>{a}</button>
+      ))}</div></Label>
+      <div style={{ display: "flex", gap: 8, marginTop: 20 }}>
+        <button onClick={() => { if (name.trim()) onSubmit({ ...(data || {}), name: name.trim(), avatar }); }} style={{ padding: "10px 28px", borderRadius: 10, border: "none", background: "#6366f1", color: "white", fontWeight: 700, cursor: "pointer", fontSize: 13 }}>{data ? "שמור" : "הוסף"}</button>
+        <button onClick={onCancel} style={{ padding: "10px 20px", borderRadius: 10, border: "1px solid #334155", background: "transparent", color: "#94a3b8", cursor: "pointer", fontSize: 13, fontWeight: 600 }}>ביטול</button>
+      </div>
+    </div>
+  );
+}
+
+function LeaveForm({ employees, defaultEmpId, onSubmit, onCancel }) {
+  const [empId, setEmpId] = useState(defaultEmpId || employees[0]?.id || "");
+  const [type, setType] = useState("vacation");
+  const [startDate, setStartDate] = useState("");
+  const [endDate, setEndDate] = useState("");
+  const [days, setDays] = useState("");
+  const [note, setNote] = useState("");
+  const [manualDays, setManualDays] = useState(false);
+  const autoDays = startDate && endDate && new Date(endDate) >= new Date(startDate) ? calcWorkDays(startDate, endDate) : 0;
+  return (
+    <div>
+      <Label t="עובד"><select value={empId} onChange={e => setEmpId(+e.target.value)} style={IS}>{employees.map(e => <option key={e.id} value={e.id}>{e.avatar} {e.name}</option>)}</select></Label>
+      <Label t="סוג"><div style={{ display: "flex", gap: 8 }}>{[["vacation", "🏖️ חופשה"], ["sick", "🏥 מחלה"]].map(([v, l]) => (
+        <button key={v} onClick={() => setType(v)} style={{ flex: 1, padding: "10px", borderRadius: 8, cursor: "pointer", fontSize: 13, fontWeight: 700, border: type === v ? "2px solid #6366f1" : "1px solid #334155", background: type === v ? "#1e1b4b" : "#0f172a", color: "#e2e8f0" }}>{l}</button>
+      ))}</div></Label>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+        <Label t="מתאריך"><input type="date" value={startDate} onChange={e => setStartDate(e.target.value)} style={IS} /></Label>
+        <Label t="עד תאריך"><input type="date" value={endDate} onChange={e => setEndDate(e.target.value)} style={IS} /></Label>
+      </div>
+      {autoDays > 0 && (
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
+          <span style={{ fontSize: 13, color: "#818cf8", fontWeight: 700 }}>📅 {manualDays ? days : autoDays} ימים</span>
+          <label style={{ fontSize: 11, color: "#64748b", display: "flex", alignItems: "center", gap: 4, cursor: "pointer" }}>
+            <input type="checkbox" checked={manualDays} onChange={e => { setManualDays(e.target.checked); setDays(autoDays); }} />הזנה ידנית (חצי יום)
+          </label>
+        </div>
+      )}
+      {manualDays && <Label t="מספר ימים"><input type="number" value={days} onChange={e => setDays(+e.target.value)} style={IS} min={0.5} step={0.5} /></Label>}
+      <Label t="הערה"><textarea value={note} onChange={e => setNote(e.target.value)} style={{ ...IS, minHeight: 50, resize: "vertical" }} placeholder="הערה..." /></Label>
+      <div style={{ display: "flex", gap: 8, marginTop: 16 }}>
+        <button onClick={() => { if (empId && startDate && endDate) onSubmit({ empId, type, startDate, endDate, days: manualDays ? days : autoDays, note: note.trim() }); }} style={{ padding: "10px 28px", borderRadius: 10, border: "none", background: "#6366f1", color: "white", fontWeight: 700, cursor: "pointer", fontSize: 13 }}>שלח</button>
+        <button onClick={onCancel} style={{ padding: "10px 20px", borderRadius: 10, border: "1px solid #334155", background: "transparent", color: "#94a3b8", cursor: "pointer", fontSize: 13, fontWeight: 600 }}>ביטול</button>
+      </div>
+    </div>
+  );
+}
